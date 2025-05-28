@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "homebrew-mcp": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/path/to/your/project/",
+        "homebrew_mcp.py"
+      ],
+      "type": "stdio"
+    }
+  }
+} 
