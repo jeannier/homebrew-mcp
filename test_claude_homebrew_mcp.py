@@ -8,16 +8,23 @@
 # - Interacts with Claude (Anthropic API) using user input and tool calls
 # - Prints all results to stdout
 #
-
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-import anthropic
 import asyncio
 import logging
+import sys
 
-# Configure logging to suppress INFO messages from the mcp library and httpx
-logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
-logging.getLogger("httpx").setLevel(logging.WARNING) # Also quiet down httpx as it's noisy
+import anthropic
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+# Configure logging to show only the message.
+logging.basicConfig(level=logging.INFO, format='%(message)s', force=True)
+logger = logging.getLogger("claude_test")
+
+# Suppress noisy logs from other libraries by setting their level higher.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("mcp.client.stdio").setLevel(logging.WARNING)
+logging.getLogger("mcp.shared.session").setLevel(logging.WARNING)
+logging.getLogger("mcp.server.lowlevel.server").setLevel(logging.WARNING)
 
 # Define server parameters to run the Homebrew MCP server
 server_params = StdioServerParameters(
@@ -26,7 +33,9 @@ server_params = StdioServerParameters(
     env=None
 )
 
-ANTHROPIC_API_KEY = "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"
+# --- Anthropic API Key Configuration ---
+# IMPORTANT: Replace the dummy key below with your actual Anthropic API key.
+ANTHROPIC_API_KEY = "sk-ant-api03-DUMMY_KEY_Abc123_DO_NOT_USE-THIS_IS_A_PLACEHOLDER_DeF456"
 
 # Example prompts to exercise each command
 PROMPTS = [
@@ -34,7 +43,7 @@ PROMPTS = [
     "restore initial state of wget",
     "check for outdated packages",
     "provide a summary of all installed packages",
-    "provide suggestions of other packages to install",
+    "provide 5 suggestions of other packages to install",
     "use brew doctor to see if there are any issues, try to find a fix for all of these issues",
     'provide a summary of what was done'
 ]
@@ -72,99 +81,79 @@ def format_tools_for_claude(mcp_tools_list):
 
 async def run():
     """Run an interactive Claude + MCP Homebrew test."""
-    anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+    log_width = 80 # Define a fixed width for aligned logging
+
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             
-            # session.list_tools() returns a result object (e.g., ListToolsResult).
-            # The actual list of MCP Tool objects is in its .tools attribute.
             mcp_tools_result = await session.list_tools()
-            print(f"\033[94m[MCP] Discovered raw tools result from server (MCP format): {mcp_tools_result}\033[0m")
+            logger.debug("Discovered raw tools result from server (MCP format): %s", mcp_tools_result)
             
-            # Extract the list of Tool objects, defaulting to an empty list if not found.
             actual_mcp_tools_list = mcp_tools_result.tools if mcp_tools_result and hasattr(mcp_tools_result, 'tools') else []
             
-            # Fail if no tools are discovered from the MCP server.
             if not actual_mcp_tools_list:
                 raise RuntimeError("No tools discovered from the MCP server. At least one tool is required.")
             
-            print(f"\033[94m[MCP] Number of tools found (MCP server count): {len(actual_mcp_tools_list)}\033[0m")
+            logger.debug("Number of tools found (MCP server count): %d", len(actual_mcp_tools_list))
 
-            # Convert MCP Tool objects to the format expected by the Claude API.
             tools_for_claude = format_tools_for_claude(actual_mcp_tools_list)
-            print(f"\033[94m[MCP] Formatted tools for Claude (Claude API format): {tools_for_claude}\033[0m")
+            logger.debug("Formatted tools for Claude (Claude API format): %s", tools_for_claude)
             
-            print(f"\033[94m[MCP] Number of tools formatted for Claude: {len(tools_for_claude)}\033[0m")
+            logger.debug("Number of tools formatted for Claude: %d", len(tools_for_claude))
 
             conversation = []
             total_prompts = len(PROMPTS)
             for idx, prompt in enumerate(PROMPTS, 1):
-                print(f"\n\033[1;30m===== Claude Prompt {idx}/{total_prompts} =====\n{prompt}\n========================\033[0m\n")
+                prompt_header = f" Claude Prompt {idx}/{total_prompts} ".center(log_width, '=')
+                logger.info("\n%s\n%s\n%s", prompt_header, prompt, '=' * log_width)
                 conversation.append({"role": "user", "content": prompt})
                 
-                # Main interaction loop: continues until Claude responds without requesting tools.
-                # This allows Claude to make multiple tool calls for a single user prompt.
-                while True:
-                    response = anthropic_client.messages.create(
-                        model="claude-3-7-sonnet-latest",
-                        max_tokens=1000,
-                        messages=conversation,
-                        tools=tools_for_claude,
-                    )
-                    
-                    # Check if Claude's response includes any tool use requests.
-                    tool_calls = [block for block in getattr(response, 'content', []) if getattr(block, 'type', None) == "tool_use"]
-                    
-                    if tool_calls:
-                        # Append Claude's response (which includes tool_use blocks) to the conversation history.
-                        # This gives Claude context of its own reasoning that led to the tool calls.
+                try:
+                    while True:
+                        response = await anthropic_client.messages.create(
+                            model="claude-3-7-sonnet-latest",
+                            max_tokens=1000,
+                            messages=conversation,
+                            tools=tools_for_claude,
+                        )
+                        
+                        tool_calls = [block for block in getattr(response, 'content', []) if getattr(block, 'type', None) == "tool_use"]
+                        
+                        if not tool_calls:
+                            logger.debug("Claude made no tool requests.")
+                            if hasattr(response, 'content') and response.content:
+                                answer_text = response.content[0].text.strip()
+                                answer_header = f" Claude's Answer {idx}/{total_prompts} ".center(log_width, '=')
+                                logger.info("%s\n%s\n%s", answer_header, answer_text, '=' * log_width)
+                            break
+
                         conversation.append({"role": "assistant", "content": response.content})
                         
                         for tool_call in tool_calls:
-                            print(f"\033[92m[MCP] Claude requested tool: {tool_call.name} with input: {tool_call.input}\033[0m")
-                            tool_name = tool_call.name
-                            tool_input = tool_call.input
-                            # Execute the tool call via the MCP session.
-                            result = await session.call_tool(tool_name, arguments=tool_input)
-                            print(f"\033[92m[MCP] Tool reply: {result}\033[0m")
+                            logger.debug("Claude requested tool: %s with input: %s", tool_call.name, tool_call.input)
+                            result = await session.call_tool(tool_call.name, arguments=tool_call.input)
+                            logger.debug("Tool reply: %s", result)
                             
-                            # Extract plain text content from the MCP tool result for Claude.
-                            # MCP tool results can be simple strings or structured objects.
+                            tool_content = str(result)
                             if isinstance(result, str):
                                 tool_content = result
                             elif hasattr(result, "content") and result.content and hasattr(result.content[0], "text"):
-                                # Handles results like mcp.types.ToolResult with TextContent.
                                 tool_content = result.content[0].text
-                            else:
-                                # Fallback to string representation for other result types.
-                                tool_content = str(result)
                             
-                            # Prepare the tool result message in the format Claude expects.
-                            tool_result_message = {
-                                "role": "user", # Critically, tool results are passed as "user" role messages.
-                                "content": [
-                                    {
-                                        "type": "tool_result",
-                                        "tool_use_id": tool_call.id, # Link to the specific tool_use request.
-                                        "content": tool_content,   # The processed output of the tool.
-                                    }
-                                ],
-                            }
-                            conversation.append(tool_result_message)
-                        
-                        # After processing all tool calls for this turn, send the updated conversation
-                        # back to Claude to get its next response (which might be more tool calls or a final answer).
-                        continue
-                    else:
-                        # If there are no tool calls, Claude has provided its final textual answer.
-                        print("\033[93m[MCP] Claude made no tool requests.\033[0m")
-                        if hasattr(response, 'content') and response.content:
-                            print("\n\033[95m=== Claude's Answer ===\033[0m")
-                            print(f"\033[95m{response.content[0].text.strip()}\033[0m")
-                            print("\033[95m============================\033[0m\n")
-                        # Break the inner while loop to move to the next user prompt (if any).
-                        break
+                            conversation.append({
+                                "role": "user",
+                                "content": [{"type": "tool_result", "tool_use_id": tool_call.id, "content": tool_content}],
+                            })
+
+                except anthropic.AuthenticationError:
+                    logger.error("Fatal Error: Authentication failed. The API key is invalid or has expired.")
+                    sys.exit(1)
+                except Exception as e:
+                    logger.exception("An unexpected error occurred during API interaction: %s", e)
+                    sys.exit(1)
 
 if __name__ == "__main__":
     asyncio.run(run()) 

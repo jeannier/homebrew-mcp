@@ -1,145 +1,408 @@
 #!/usr/bin/env python
 #
-# homebrew_mcp.py - Homebrew MCP server for package management
+# homebrew_mcp.py - Homebrew MCP server for package management on macOS
+#
+# Description:
+# A Model Context Protocol (MCP) server that exposes Homebrew package management
+# functionality to MCP clients like Claude Desktop. Designed for seamless integration
+# with LLMs and AI assistants.
 #
 # Features:
-# - Publishes each Homebrew command as a separate MCP tool
-# - Runs real 'brew $command' via subprocess for all supported commands
-# - Logs all requests/results to homebrew_mcp.log with timestamp
-# - MCP spec-compliant, no classes, functional style
+# - Exposes Homebrew commands as individual MCP tools
+# - Runs real 'brew' commands via subprocess for authentic behavior
+# - Logs all requests/results as structured JSON to homebrew_mcp.log
+# - MCP spec-compliant (stdio, JSON-RPC 2.0, MCP spec 2025-06-18)
+# - Functional, declarative Python style (no classes in main logic)
+#
+# Requirements:
+# - Python 3.13+ (uses modern type hints and features)
+# - macOS with Homebrew installed
+# - MCP Python SDK (>=1.9.4)
 #
 
-from mcp.server.fastmcp import FastMCP
 import json
-import os # Used for path manipulation (e.g., LOG_FILE).
-from datetime import datetime, timezone # For timestamping log entries.
-import subprocess # For running external Homebrew commands.
+import logging
+import os
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 
-# Initialize the FastMCP server instance with a descriptive name and set its log level.
-# log_level="WARNING" will suppress INFO messages like "Processing request of type..."
-# originating from the FastMCP server itself.
-server = FastMCP("Homebrew Package MCP", log_level="WARNING")
+from mcp.server.fastmcp import FastMCP
 
-# COMMANDS dictionary: Defines the Homebrew commands to be exposed as MCP tools.
-# Each key is the command name (e.g., "install").
-# The value is a dictionary specifying:
-#   "desc": A description for the tool, used by clients like Claude.
-#   "takes_package": A boolean indicating if the command requires a package name argument.
+# --- Setup Logging ---
+
+class JsonFormatter(logging.Formatter):
+    """Formats log records as a single line of JSON."""
+    def format(self, record):
+        # This custom formatter ensures that all log output is structured as JSON,
+        # which is easier for other tools to parse.
+        super().format(record)  # This populates record.message and other standard fields.
+        # The ** operator unpacks the message if it's a dictionary, allowing
+        # structured data to be merged directly into the JSON log.
+        return json.dumps({
+            "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "level": record.levelname,
+            "name": record.name,
+            **(record.msg if isinstance(record.msg, dict) else {"message": record.message})
+        })
+
+# Initialize logger with structured JSON output
+logger = logging.getLogger("homebrew_mcp")
+logger.setLevel(logging.INFO)
+logger.propagate = False  # Avoid duplicate logs to any root logger.
+
+# Set up log file in same directory as script
+log_file_path = Path(__file__).parent / "homebrew_mcp.log"
+file_handler = logging.FileHandler(log_file_path)
+file_handler.setFormatter(JsonFormatter())
+logger.addHandler(file_handler)
+
+# Suppress noisy INFO logs from the underlying MCP server library
+logging.getLogger("mcp.server.lowlevel.server").setLevel(logging.WARNING)
+
+
+# --- Configuration ---
+
+# This dictionary is the central configuration for dynamic tool generation.
+# Each key is a command name, and its value defines the tool's description,
+# parameters, and command-line options. The server uses this structure to
+# build and register all MCP tools automatically.
 COMMANDS = {
-    "install": {"desc": "Install a Homebrew package by name.", "takes_package": True},
-    "uninstall": {"desc": "Uninstall a Homebrew package by name.", "takes_package": True},
-    "info": {"desc": "Fetch Homebrew package info using Homebrew.", "takes_package": True},
-    "upgrade": {"desc": "Upgrade a Homebrew package by name.", "takes_package": True},
-    "list": {"desc": "List all Homebrew packages using Homebrew.", "takes_package": False},
-    "search": {"desc": "Search for a Homebrew package.", "takes_package": True},
-    "doctor": {"desc": "Check your system for potential Homebrew problems.", "takes_package": False},
-    "reinstall": {"desc": "Reinstall a Homebrew package.", "takes_package": True},
-    "outdated": {"desc": "List outdated Homebrew packages.", "takes_package": False},
+    "install": {
+        "description": "Installs the given formula or cask.",
+        "params": [
+            {"name": "names", "type": "list", "required": True, "help": "Name of the formula(e) or cask(s) to install."},
+        ],
+        "options": [
+            {"name": "cask", "flag": "--cask", "type": "bool", "help": "Treat all named arguments as casks."},
+            {"name": "force", "flag": "--force", "short_flag": "-f", "type": "bool", "help": "Install without checking for previous installations."},
+            {"name": "verbose", "flag": "--verbose", "short_flag": "-v", "type": "bool", "help": "Print verbose output."},
+            {"name": "dry_run", "flag": "--dry-run", "type": "bool", "help": "Show what would be installed, but do not actually install anything."},
+            {"name": "build_from_source", "flag": "--build-from-source", "short_flag": "-s", "type": "bool", "help": "Compile from source."},
+            {"name": "HEAD", "flag": "--HEAD", "type": "bool", "help": "Install the development version."},
+        ]
+    },
+    "uninstall": {
+        "description": "Uninstalls the given formula or cask.",
+        "params": [
+            {"name": "names", "type": "list", "required": True, "help": "Name of the formula(e) or cask(s) to uninstall."},
+        ],
+        "options": [
+            {"name": "cask", "flag": "--cask", "type": "bool", "help": "Treat all named arguments as casks."},
+            {"name": "force", "flag": "--force", "short_flag": "-f", "type": "bool", "help": "Force uninstallation."},
+            {"name": "zap", "flag": "--zap", "type": "bool", "help": "Remove all files associated with a cask."},
+        ]
+    },
+    "untap": {
+        "description": "Removes the given tap(s).",
+        "params": [
+            {"name": "names", "type": "list", "required": True, "help": "Name of the tap(s) to remove."},
+        ],
+        "options": []
+    },
+    "upgrade": {
+        "description": "Upgrades outdated casks and formulae.",
+        "params": [
+            {"name": "names", "type": "list", "required": False, "help": "Name of the specific formula(e) or cask(s) to upgrade."},
+        ],
+        "options": [
+            {"name": "cask", "flag": "--cask", "type": "bool", "help": "Only upgrade casks."},
+            {"name": "greedy", "flag": "--greedy", "type": "bool", "help": "Also upgrade casks with `auto_updates` true."},
+            {"name": "dry_run", "flag": "--dry-run", "type": "bool", "help": "Show what would be upgraded, without actually upgrading."},
+            {"name": "force", "flag": "--force", "short_flag": "-f", "type": "bool", "help": "Force upgrade of casks even if they are already installed."}
+        ]
+    },
+    "list": {
+        "description": "Lists installed formulae or casks.",
+        "params": [],
+        "options": [
+            {"name": "cask", "flag": "--cask", "type": "bool", "help": "List only installed casks."},
+            {"name": "versions", "flag": "--versions", "type": "bool", "help": "Show the version number for installed formulae."},
+            {"name": "pinned", "flag": "--pinned", "type": "bool", "help": "List only pinned formulae."},
+        ]
+    },
+    "search": {
+        "description": "Performs a search of formulae and casks.",
+        "params": [
+            {"name": "query", "type": "str", "required": True, "help": "The search query, can be text or a /regex/."},
+        ],
+        "options": [
+            {"name": "casks", "flag": "--casks", "type": "bool", "help": "Search only casks."},
+        ]
+    },
+    "info": {
+        "description": "Displays information about a formula or cask.",
+        "params": [
+            {"name": "name", "type": "str", "required": True, "help": "Name of the formula or cask."},
+        ],
+        "options": [
+            {"name": "json_format", "flag": "--json", "type": "str", "help": "Output in JSON format. Use 'v2' for the latest version."},
+        ]
+    },
+    "doctor": {
+        "description": "Checks your system for potential problems.",
+        "params": [],
+        "options": []
+    },
+    "update": {
+        "description": "Fetches the newest version of Homebrew and all formulae.",
+        "params": [],
+        "options": []
+    },
+    "outdated": {
+        "description": "Shows formulae and casks that have an updated version available.",
+        "params": [],
+        "options": [
+             {"name": "cask", "flag": "--cask", "type": "bool", "help": "List only outdated casks."},
+             {"name": "greedy", "flag": "--greedy", "type": "bool", "help": "Also list casks with `auto_updates` true."},
+        ]
+    },
+    "cleanup": {
+        "description": "Removes stale lock files and outdated downloads for a specific formula or cask, or for all if none is specified.",
+        "params": [
+            {"name": "name", "type": "str", "required": False, "help": "Specific formula or cask to clean up."},
+        ],
+        "options": [
+            {"name": "dry_run", "flag": "--dry-run", "short_flag": "-n", "type": "bool", "help": "Show what would be removed."},
+            {"name": "scrub_cache", "flag": "-s", "type": "bool", "help": "Scrub the cache of downloaded files."},
+        ]
+    },
+    "services": {
+        "description": "Manages Homebrew services.",
+        # Special case: services command requires subcommand structure
+        "base_command": ["services"],
+        "params": [
+            {"name": "subcommand", "type": "str", "required": True, "help": "The service subcommand to run (e.g., 'list', 'start', 'stop')."},
+            {"name": "name", "type": "str", "required": False, "help": "The name of the service to act on."}
+        ],
+        "options": []
+    },
+    "tap": {
+        "description": "Adds the given tap(s).",
+        "params": [
+            {"name": "names", "type": "list", "required": True, "help": "Name of the tap(s) to add."},
+        ],
+        "options": []
+    },
+    "pin": {
+        "description": "Pins the given formula(e), preventing them from being upgraded.",
+        "params": [
+            {"name": "names", "type": "list", "required": True, "help": "Name of the formula(e) to pin."},
+        ],
+        "options": []
+    },
+    "unpin": {
+        "description": "Unpins the given formula(e), allowing them to be upgraded.",
+        "params": [
+            {"name": "names", "type": "list", "required": True, "help": "Name of the formula(e) to unpin."},
+        ],
+        "options": []
+    },
+    "deps": {
+        "description": "Shows the dependencies for the given formula(e).",
+        "params": [
+            {"name": "names", "type": "list", "required": True, "help": "Name of the formula(e) to show dependencies for."},
+        ],
+        "options": []
+    }
 }
 
-# LOG_FILE: Defines the path to the log file where all server activity is recorded.
-# It's placed in the same directory as the script.
-LOG_FILE = os.path.join(os.path.dirname(__file__), "homebrew_mcp.log")
 
-def log_request(action: str, package: str, success: bool, output: str, reply: str = None, command: str = None):
-    """Log each tool call to homebrew_mcp.log as a JSON line.
+# --- Utility Functions ---
 
-    Includes timestamp, action, package (if any), success status, raw output from brew,
-    the reply sent to the MCP client (if successful), and the exact brew command executed.
-    This structured logging helps in debugging and auditing server operations.
-    """
-    entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(), # UTC timestamp in ISO format.
-        "action": action,       # The Homebrew action (e.g., "install", "list").
-        "package": package,     # The package name involved, if applicable.
-        "success": success,     # Boolean indicating if the brew command was successful.
-        "output": output,       # Raw stdout/stderr from the brew command.
-        "reply": reply,         # The content sent back to the MCP client (usually same as output on success).
-        "command": command,     # The full 'brew' command string that was executed.
-    }
-    with open(LOG_FILE, "a", encoding="utf-8") as f: # Append to the log file.
-        f.write(json.dumps(entry) + "\n") # Write each log entry as a new JSON line.
-
-def run_brew_command(action: str, package: str = None):
-    """Run a real Homebrew command using subprocess and return its success status, output, and the command string.
-
-    Constructs a command list (e.g., ['brew', 'install', 'wget']).
-    Executes the command, capturing its stdout and stderr.
-    Handles successful execution (returncode 0) and errors.
-    A timeout is set for the subprocess to prevent indefinite hanging.
-    """
-    cmd = ["brew", action] # Base command.
-    if package:
-        cmd.append(package) # Append package name if the action requires it.
-    
-    cmd_str = " ".join(cmd) # Create a string version of the command for logging.
+def execute_brew_command(command_list):
+    """Executes a brew command, logs the interaction, and returns the result."""
+    # Initialize log entry with the command being executed
+    log_entry = {"event": "brew_command", "command": command_list}
 
     try:
-        # Execute the command. capture_output=True gets stdout/stderr.
-        # text=True decodes output as text. timeout prevents hanging.
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
-        if result.returncode == 0:
-            # Command was successful.
-            return True, result.stdout.strip(), cmd_str
-        # Command failed. Return stderr if available, otherwise stdout (some brew errors go to stdout).
-        return False, (result.stderr.strip() or result.stdout.strip()), cmd_str
-    except subprocess.TimeoutExpired:
-        # Handle command timeout specifically.
-        return False, f"Command '{cmd_str}' timed out after 60 seconds.", cmd_str
-    except Exception as e:
-        # Handle other potential exceptions during subprocess execution.
-        return False, f"Command '{cmd_str}' failed with exception: {e}", cmd_str
+        # To ensure `brew` runs in a predictable environment, we create a minimal
+        # set of environment variables. This avoids issues from custom shell configs.
+        env_path = os.environ.get("PATH", "")
+        # `brew doctor` can issue a warning if Homebrew's sbin directory is not in
+        # the PATH. We prepend it to proactively resolve this.
+        homebrew_sbin = "/opt/homebrew/sbin"
+        if homebrew_sbin not in env_path:
+            env_path = f"{homebrew_sbin}:{env_path}"
+        
+        # We only pass essential variables to the subprocess.
+        brew_env = {
+            "PATH": env_path,
+            "HOME": os.environ.get("HOME", ""),
+        }
 
-def make_tool(action: str):
-    """Dynamically creates and registers an MCP tool for a given Homebrew action.
+        # Execute the command. `check=False` means we handle non-zero exit codes manually.
+        process = subprocess.run(
+            command_list,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=brew_env,
+        )
+        # Clean up output by removing leading/trailing whitespace
+        stdout = process.stdout.strip()
+        stderr = process.stderr.strip()
+        
+        # Log the complete interaction, including output and return code.
+        log_entry["result"] = {"stdout": stdout, "stderr": stderr, "returncode": process.returncode}
+        logger.info(log_entry)
+        
+        # If the command failed, return the error. Prefer stderr, but fall back to stdout.
+        if process.returncode != 0:
+            return f"Error: {stderr or stdout}"
+        # If successful, return stdout or a generic success message if there's no output.
+        return stdout or "Command executed successfully."
 
-    Uses the 'action' (e.g., "install") to look up metadata from the COMMANDS dictionary.
-    It defines a nested function ('_tool') which becomes the actual handler for the MCP tool.
-    This handler calls 'run_brew_command' and processes its result.
-    If the brew command is successful, its output is returned to the MCP client.
-    If it fails, a ValueError is raised with the error output, which MCP forwards as an error.
-    Two versions of '_tool' are defined based on whether the command 'takes_package'.
-    """
-    # Get metadata (description, if it takes a package) from COMMANDS.
-    # Defaults are provided if the action is not in COMMANDS (though it always should be here).
-    meta = COMMANDS.get(action, {"desc": f"Run 'brew {action}' via subprocess.", "takes_package": False})
-    desc = meta["desc"]
-    takes_package = meta["takes_package"]
+    except FileNotFoundError:
+        # This occurs if 'brew' is not installed or not in the system's PATH.
+        error_message = "Error: 'brew' command not found. Make sure Homebrew is installed and in your PATH."
+        log_entry["result"] = {"error": error_message}
+        logger.error(log_entry)
+        return error_message
 
-    if takes_package:
-        # Define a tool handler for commands that require a 'package' argument.
-        @server.tool(name=action, description=desc)
-        def _tool(package: str) -> str: # Type hint: takes a string, returns a string.
-            success, output, command_str = run_brew_command(action, package)
-            if success:
-                reply = output # On success, the reply is the command's output.
-                log_request(action, package, success, output, reply, command_str)
-                return reply
-            # On failure, log the attempt and raise ValueError.
-            # FastMCP catches ValueError and translates it into an MCP error response.
-            log_request(action, package, success, output, None, command_str)
-            raise ValueError(output)
-        return _tool # Return the created tool handler function.
-    else:
-        # Define a tool handler for commands that do not take any arguments.
-        @server.tool(name=action, description=desc)
-        def _tool() -> str: # Type hint: takes no arguments, returns a string.
-            success, output, command_str = run_brew_command(action)
-            if success:
-                reply = output
-                log_request(action, "", success, output, reply, command_str) # Empty string for package.
-                return reply
-            log_request(action, "", success, output, None, command_str)
-            raise ValueError(output)
-        return _tool
+def create_tool_function(name, config):
+    """Dynamically creates a Python function for a given brew command configuration."""
+    # This function uses metaprogramming to generate a Python function on the fly.
+    # It constructs the function's definition as a string and then uses `exec`
+    # to compile and load it into the module's namespace.
+    param_list = []
+    # Handle positional arguments. Parameters of type 'list' expect a list of values.
+    # Non-required parameters get a default value of None.
+    for param in config.get("params", []):
+        default = '=None' if not param.get('required') else ''
+        if not default:
+             param_list.append(f"{param['name']}")
+        else:
+             param_list.append(f"{param['name']}{default}")
 
-# Register all defined Homebrew commands as MCP tools.
-# This loop iterates through the keys of the COMMANDS dictionary (e.g., "install", "list")
-# and calls make_tool() for each one, which creates and registers the corresponding tool.
-for cmd_key in COMMANDS.keys():
-    make_tool(cmd_key)
+    # Keyword-only arguments from 'options'
+    if config.get("options"):
+        # Force options to be keyword-only arguments for clarity in function calls.
+        # An isolated '*' in a function signature separates positional from keyword-only arguments.
+        if config.get("params"):
+            param_list.append("*")
+        # if there are no positional args, all options are keyword-only by default, but we need '*' if we want to enforce it
+        elif not config.get("params"):
+            param_list.insert(0, "*")
 
-# Standard Python entry point: if this script is run directly, start the MCP server.
-# server.run() starts the FastMCP server, listening for requests (e.g., over stdio).
+        # Handle options, which will be keyword-only arguments.
+        for option in config["options"]:
+            if option["type"] == "bool":
+                param_list.append(f"{option['name']}=False")
+            elif option["type"] == "str":
+                 param_list.append(f"{option['name']}=None")
+
+    # The base command can be a single string (like 'install') or a list (like ['services', 'list']).
+    base_command = config.get("base_command", [name.replace('_', '-')])
+
+    # Build the function's body as a series of strings.
+    # The body constructs the `brew` command list based on arguments.
+    lines = [f"    command = ['brew'] + {base_command!r}"]
+
+    # Add parameters to the command list
+    for param in config.get("params", []):
+        p_name = param['name']
+        if param['required']:
+            lines.append(f"    if {p_name}:")
+        else:
+            lines.append(f"    if {p_name} is not None:")
+
+        if param.get("type") == "list":
+            # Ensure the argument is a list to handle cases where a single string is passed.
+            lines.append(f"        items = {p_name} if isinstance({p_name}, list) else [{p_name}]")
+            lines.append(f"        command.extend(map(str, items))")
+        else:
+            lines.append(f"        command.append(str({p_name}))")
+
+    # Add options (flags) to the command list
+    for option in config.get("options", []):
+        o_name = option['name']
+        flag = option['flag']
+        lines.append(f"    if {o_name}:")
+        if option["type"] == "bool":
+            # Boolean options just add the flag
+            lines.append(f"        command.append('{flag}')")
+        elif option["type"] == "str":
+            # String options add both the flag and its value
+            lines.append(f"        command.extend(['{flag}', str({o_name})])")
+
+    # Execute the constructed brew command
+    lines.append("    return execute_brew_command(command)")
+
+    # Assemble the complete function definition
+    func_body = "\n".join(lines)
+    signature = ", ".join(param_list)
+    # The full function definition is created as a string.
+    func_def = f"def {name}({signature}):\n{func_body}"
+
+    # The `exec` function compiles and runs the string as Python code.
+    # The new function is defined within the `local_scope` dictionary.
+    local_scope = {}
+    exec(func_def, globals(), local_scope)
+
+    # Extract the newly created function from the local scope
+    new_func = local_scope[name]
+    # Set the docstring for the newly created function from the configuration.
+    new_func.__doc__ = config['description']
+    return new_func
+
+
+# --- Main Application ---
+
+def main():
+    """Sets up and runs the FastMCP server."""
+    logger.info({"event": "server_setup_start", "message": "Starting FastMCP server setup..."})
+    start_time = time.time()
+    
+    # Initialize the FastMCP application with server metadata
+    app = FastMCP(
+        "homebrew",
+        "Homebrew package manager",
+        auth_server_provider=None,
+        tool_homepage="https://github.com/jeannier/homebrew-mcp",
+        auth=None,
+    )
+    logger.info({
+        "event": "app_initialized",
+        "message": "FastMCP app initialized.",
+        "duration_seconds": round(time.time() - start_time, 2)
+    })
+
+    # Dynamically register all brew commands as MCP tools
+    logger.info({"event": "tool_registration_start", "message": "Registering all tools..."})
+    registration_start_time = time.time()
+    for name, config in COMMANDS.items():
+        tool_creation_start_time = time.time()
+        # Create a function for this specific brew command
+        tool_func = create_tool_function(name, config)
+        # Register the function as an MCP tool
+        app.tool(name)(tool_func)
+        logger.info({
+            "event": "tool_registered",
+            "tool_name": name,
+            "duration_seconds": round(time.time() - tool_creation_start_time, 4)
+        })
+
+    # Log timing information for performance monitoring
+    total_registration_time = time.time() - registration_start_time
+    logger.info({
+        "event": "tool_registration_end",
+        "message": "All tools registered.",
+        "duration_seconds": round(total_registration_time, 2)
+    })
+
+    total_setup_time = time.time() - start_time
+    logger.info({
+        "event": "server_setup_end",
+        "message": "Total server setup time.",
+        "duration_seconds": round(total_setup_time, 2)
+    })
+    
+    # Start the MCP server
+    logger.info({"event": "server_run", "message": "Running FastMCP server..."})
+    app.run()
+
+# Entry point - run the server when script is executed directly
 if __name__ == "__main__":
-    server.run()
+    main()

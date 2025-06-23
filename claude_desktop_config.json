@@ -5,7 +5,7 @@
       "args": [
         "run",
         "--directory",
-        "/path/to/your/project/",
+        "~/Documents/GitHub/homebrew-mcp",
         "homebrew_mcp.py"
       ],
       "type": "stdio"

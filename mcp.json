@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "homebrew-mcp": {
+        "command": "uv run --directory ~/Documents/GitHub/homebrew-mcp homebrew_mcp.py"
+    }
+  }
+} 
