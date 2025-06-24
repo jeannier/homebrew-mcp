@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/jeannier-homebrew-mcp-badge.png)](https://mseep.ai/app/jeannier-homebrew-mcp)
+
 # Homebrew MCP Python Server
 
 A Model Context Protocol (MCP) server for Homebrew package management **on macOS**, designed for seamless integration with Claude Desktop and other MCP-compatible clients.
